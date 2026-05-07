@@ -6,7 +6,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(feature = "async")]
 use std::pin::Pin;
 #[cfg(feature = "async")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "async")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "async")]
@@ -217,19 +217,26 @@ impl AsyncWrite for AsyncHttpStream {
     }
 }
 
+/// The starting value of [`AsyncConnectionState::permits`]. We pick `usize::MAX / 2` so that we
+/// can detect counter underflows as `prev > MAX_SEND_PERMITS`.
+#[cfg(feature = "async")]
+const MAX_SEND_PERMITS: usize = usize::MAX / 2;
+
 #[cfg(feature = "async")]
 struct AsyncConnectionState {
     write: AsyncMutex<WriteHalf<AsyncHttpStream>>,
     read: AsyncMutex<tokio::io::BufReader<ReadHalf<AsyncHttpStream>>>,
-    /// The ID of the next request we'll send. If this reaches [`usize::MAX`] no further requests
-    /// can be sent on this socket and a new connection must be made. Thus, in order to limit the
-    /// connection to sending N new requests, this may be set to [`usize::MAX`] - N.
+    /// Remaining permits for sending new requests. Acquired via `fetch_sub(1)`; an underflow is
+    /// detected as `prev == 0 || prev > MAX_SEND_PERMITS`. Poisoned by storing `0`; capped by
+    /// keep-alive `max=N` via `fetch_min(N)`.
+    permits: AtomicUsize,
+    /// Monotonic ID of the next request to send, used only for pipelining order.
     next_request_id: AtomicUsize,
-    /// The ID of the next request which is readable from the socket. If we're pipelining this may
-    /// be a few behind [`Self::next_request_id`]. If this is [`usize::MAX`], the socket is in an
-    /// indeterminate state and no further reading is allowed. Any pending requests must either be
-    /// retried or failed.
+    /// ID of the next request readable from the socket; may lag [`Self::next_request_id`].
     readable_request_id: AtomicUsize,
+    /// Set when the read half is in an indeterminate state and pending pipelined readers must
+    /// abort and retry on a fresh connection.
+    reads_dead: AtomicBool,
     /// If we have a pipelined request which has the requesting future dropped, we won't finish
     /// reading the response and thus later responses will need to be retried over a fresh
     /// connection.
@@ -241,6 +248,16 @@ struct AsyncConnectionState {
     /// Defaults to 60 seconds after open to align with nginx's default timeout of 75 seconds, but
     /// can be overridden by the `Keep-Alive` header.
     socket_new_requests_timeout: Mutex<Instant>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncConnectionState {
+    /// Attempts to acquire a send permit. Returns `true` if a permit was acquired, `false` if the
+    /// counter was poisoned (`0`) or has wrapped past zero on a previous call (`> MAX_SEND_PERMITS`).
+    fn acquire_permit(&self) -> bool {
+        let prev = self.permits.fetch_sub(1, Ordering::Relaxed);
+        prev != 0 && prev <= MAX_SEND_PERMITS
+    }
 }
 
 #[cfg(feature = "async")]
@@ -300,8 +317,10 @@ impl AsyncConnection {
                 read,
             )),
             write: AsyncMutex::new(write),
+            permits: AtomicUsize::new(MAX_SEND_PERMITS),
             next_request_id: AtomicUsize::new(0),
             readable_request_id: AtomicUsize::new(0),
+            reads_dead: AtomicBool::new(false),
             min_dropped_reader_id: AtomicUsize::new(usize::MAX),
             socket_new_requests_timeout: Mutex::new(Instant::now() + Duration::from_secs(60)),
         }))))
@@ -421,7 +440,7 @@ impl AsyncConnection {
             if !request.config.pipelining {
                 // If we're not pipelining, wait for any existing pipelined requests to complete.
                 // Specifically, wait until we have both locks and either we're going to build a
-                // new connection (because `next_request_id` is `usize::MAX`) or there are no
+                // new connection (because `permits` is exhausted/poisoned) or there are no
                 // pending readers (because `next_request_id` and `readable_request_id` are the
                 // same).
                 read = Some(Self::timeout(request.timeout_at, conn.read.lock()).await?);
@@ -429,7 +448,10 @@ impl AsyncConnection {
                 while {
                     let next_read = conn.readable_request_id.load(Ordering::Relaxed);
                     let next_request = conn.next_request_id.load(Ordering::Relaxed);
-                    next_request != usize::MAX && next_read < next_request
+                    let has_open_request = next_read < next_request;
+                    let permits = conn.permits.load(Ordering::Relaxed);
+                    let permits_alive = permits != 0 && permits <= MAX_SEND_PERMITS;
+                    permits_alive && has_open_request
                 } {
                     read.take();
                     write.take();
@@ -443,14 +465,14 @@ impl AsyncConnection {
                 (CONNECTION_STATE_UNDEFINED) => {
                     // The connection may next return bytes for a request which timed out, thus no
                     // more reads are allowed.
-                    conn.next_request_id.store(usize::MAX, Ordering::Release);
-                    conn.readable_request_id.store(usize::MAX, Ordering::Release);
+                    conn.permits.store(0, Ordering::Release);
+                    conn.reads_dead.store(true, Ordering::Release);
                     retry_new_connection!(_internal);
                 };
                 (CONNECTION_STILL_READABLE, $write_lock: ident) => {
                     // Make sure new requests don't try to use the old connection (but allow
                     // requests that have already been sent to continue trying to read from it).
-                    conn.next_request_id.store(usize::MAX, Ordering::Release);
+                    conn.permits.store(0, Ordering::Release);
                     core::mem::drop($write_lock);
                     retry_new_connection!(_internal);
                 };
@@ -480,12 +502,13 @@ impl AsyncConnection {
                 let socket_timeout = *conn.socket_new_requests_timeout.lock().unwrap();
                 let socket_timed_out = Instant::now() > socket_timeout;
 
-                request_id = conn.next_request_id.fetch_add(1, Ordering::Relaxed);
-                if request_id == usize::MAX || socket_timed_out {
+                let permit_acquired = conn.acquire_permit();
+                if !permit_acquired || socket_timed_out {
                     // We can't send additional requests on the socket or the socket timed out and
                     // need to resend the request on a new connection.
                     retry_new_connection!(CONNECTION_STILL_READABLE, write);
                 }
+                request_id = conn.next_request_id.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "log")]
                 log::trace!(
                     "Writing HTTP request id {request_id} on connection to {:?}.",
@@ -498,11 +521,11 @@ impl AsyncConnection {
                     Err(e) => {
                         // If we failed to write the request, mark the socket as dead for future
                         // requests.
-                        conn.next_request_id.store(usize::MAX, Ordering::Release);
+                        conn.permits.store(0, Ordering::Release);
                         return Err(e);
                     }
                     Ok(Err(ioe)) => {
-                        conn.next_request_id.store(usize::MAX, Ordering::Release);
+                        conn.permits.store(0, Ordering::Release);
                         return Err(Error::IoError(ioe));
                     }
                     Ok(Ok(())) => {}
@@ -516,8 +539,7 @@ impl AsyncConnection {
                 }
 
                 while {
-                    let readable = conn.readable_request_id.load(Ordering::Acquire);
-                    if readable == usize::MAX {
+                    if conn.reads_dead.load(Ordering::Acquire) {
                         // We got a `Connection: close` before our pipelined request could be handled
                         // and need to retry on a new connection.
                         debug_assert!(
@@ -527,6 +549,7 @@ impl AsyncConnection {
                         should_retry = true;
                         return Err(Error::Other("Retrying pipelining failure"));
                     }
+                    let readable = conn.readable_request_id.load(Ordering::Acquire);
                     readable < request_id
                 } {
                     // There's a race where we can finish writing but see a context switch between
@@ -572,8 +595,8 @@ impl AsyncConnection {
                     }
                 }
                 if !found_keep_alive {
-                    conn.next_request_id.store(usize::MAX, Ordering::Release);
-                    conn.readable_request_id.store(usize::MAX, Ordering::Release);
+                    conn.permits.store(0, Ordering::Release);
+                    conn.reads_dead.store(true, Ordering::Release);
                 } else {
                     conn.readable_request_id.fetch_add(1, Ordering::Release);
                 }
@@ -591,28 +614,26 @@ impl AsyncConnection {
                                                 .unwrap_or(Instant::now());
                                     }
                                     "max" => {
-                                        conn.next_request_id.fetch_max(
-                                            usize::MAX.saturating_sub(v),
-                                            Ordering::AcqRel,
-                                        );
+                                        // Cap remaining permits to at most `v`.
+                                        conn.permits.fetch_min(v.min(MAX_SEND_PERMITS), Ordering::AcqRel);
                                     }
                                     _ => {
                                         // If we can't parse the keep-alive header, don't send any
                                         // new requests over this socket, but don't give up on
                                         // reading pending responses.
-                                        conn.next_request_id.store(usize::MAX, Ordering::Release);
+                                        conn.permits.store(0, Ordering::Release);
                                     }
                                 }
                             } else {
                                 // If we can't parse the keep-alive header, don't send any new
                                 // requests over this socket, but don't give up on reading pending
                                 // responses.
-                                conn.next_request_id.store(usize::MAX, Ordering::Release);
+                                conn.permits.store(0, Ordering::Release);
                             }
                         } else {
                             // If we can't parse the keep-alive header, don't send any new requests
                             // over this socket, but don't give up on reading pending responses.
-                            conn.next_request_id.store(usize::MAX, Ordering::Release);
+                            conn.permits.store(0, Ordering::Release);
                         }
                     }
                 }
@@ -633,8 +654,8 @@ impl AsyncConnection {
                         // If we failed to read the response after reading the request, the socket
                         // is in an indeterminate state. Thus, we have to force every other waiting
                         // request to retry on a new socket.
-                        conn.next_request_id.store(usize::MAX, Ordering::Release);
-                        conn.readable_request_id.store(usize::MAX, Ordering::Relaxed);
+                        conn.permits.store(0, Ordering::Release);
+                        conn.reads_dead.store(true, Ordering::Relaxed);
                         return Err(e);
                     }
                 }
